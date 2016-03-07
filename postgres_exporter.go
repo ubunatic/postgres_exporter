@@ -13,10 +13,11 @@ import (
 	"math"
 	"time"
 
+	"strconv"
+
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/log"
-	"strconv"
 )
 
 var (
@@ -100,6 +101,7 @@ var variableMaps = map[string]map[string]ColumnMapping{
 		"max_standby_archive_delay":   {DURATION, "Sets the maximum delay before canceling queries when a hot standby server is processing archived WAL data.", nil},
 		"max_standby_streaming_delay": {DURATION, "Sets the maximum delay before canceling queries when a hot standby server is processing streamed WAL data.", nil},
 		"max_wal_senders":             {GAUGE, "Sets the maximum number of simultaneously running WAL sender processes.", nil},
+		"server_version_num":          {GAUGE, "An integer representing the server version, e.g. 9.1.20 would be 90120.", nil},
 	},
 }
 
@@ -199,7 +201,7 @@ var queryOverrides = map[string]string{
       SELECT
           pg_database.datname,
           tmp.state,
-          COALESCE(count,0) as count, 
+          COALESCE(count,0) as count,
           COALESCE(max_tx_duration,0) as max_tx_duration
       FROM
           (VALUES ('active'),('idle'),('idle in transaction'),('idle in transaction (aborted)'),('fastpath function call'),('disabled')) as tmp(state) CROSS JOIN pg_database
@@ -209,7 +211,36 @@ var queryOverrides = map[string]string{
               state,
               count(*) AS count,
               MAX(EXTRACT(EPOCH FROM now() - xact_start))::float AS max_tx_duration
-          FROM pg_stat_activity GROUP BY datname,state) as tmp2 
+          FROM pg_stat_activity GROUP BY datname,state) as tmp2
+      ON tmp.state = tmp2.state AND pg_database.datname = tmp2.datname`,
+}
+
+// Fallback queries for namespaces above, supporting v9.0/9.1
+var queryOverrideFallbacks = map[string]string{
+	"pg_stat_replication": `
+      SELECT pg_current_xlog_location(),
+            (pg_current_xlog_location()::float - pg_last_xlog_replay_location()::float) AS pg_xlog_location_diff
+        FROM pg_stat_replication`,
+
+	"pg_stat_activity": `
+      SELECT
+          pg_database.datname,
+          tmp.state,
+          COALESCE(count,0) as count,
+          COALESCE(max_tx_duration,0) as max_tx_duration
+      FROM
+          (VALUES ('active'),('idle'),('idle in transaction'),('idle in transaction (aborted)'),('fastpath function call'),('disabled')) as tmp(state) CROSS JOIN pg_database
+      LEFT JOIN
+          (SELECT
+              datname,
+              CASE WHEN current_query='<IDLE>' THEN 'idle'
+                   WHEN current_query='<IDLE> in transaction' THEN 'idle in transaction'
+                   WHEN current_query='<IDLE> in transaction (aborted)' THEN 'idle in transaction (aborted)'
+                   ELSE 'active'
+              END AS state,
+              count(*) AS count,
+              MAX(EXTRACT(EPOCH FROM now() - xact_start))::float AS max_tx_duration
+          FROM pg_stat_activity GROUP BY datname,state) as tmp2
       ON tmp.state = tmp2.state AND pg_database.datname = tmp2.datname`,
 }
 
@@ -446,6 +477,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	defer db.Close()
 
 	log.Debugln("Querying SHOW variables")
+	server_version := float64(0)
 	for _, mapping := range e.variableMap {
 		for columnName, columnMapping := range mapping.columnMappings {
 			// Check for a discard request on this value
@@ -463,6 +495,10 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 				continue
 			}
 
+			if columnName == "server_version_num" {
+				server_version, _ = dbToFloat64(val)
+			}
+
 			fval, ok := columnMapping.conversion(val)
 			if !ok {
 				e.error.Set(1)
@@ -471,6 +507,13 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			}
 
 			ch <- prometheus.MustNewConstMetric(columnMapping.desc, columnMapping.vtype, fval)
+		}
+	}
+
+	if server_version > 0 && server_version < 90200 {
+		log.Debugln("Using fallback queries for pre-9.2 server version")
+		for k, v := range queryOverrideFallbacks {
+			queryOverrides[k] = v
 		}
 	}
 
